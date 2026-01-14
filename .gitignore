@@ -1,0 +1,19 @@
+Ignore virtual environments
+
+venv/
+env/
+.env
+
+Ignore Streamlit secrets (CRITICAL)
+
+.streamlit/secrets.toml
+
+Ignore python cache files
+
+pycache/
+*.pyc
+
+Ignore data files
+
+*.csv
+*.xlsx
