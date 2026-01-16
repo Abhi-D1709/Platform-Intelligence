@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Sequence
+from typing import Callable, List, Sequence, Tuple
 
 import pandas as pd
 import plotly.express as px
@@ -39,6 +39,8 @@ def _ensure_defaults(cfg: IntelConfig) -> None:
     st.session_state.setdefault(_k(cfg, "num_results"), 10)
     st.session_state.setdefault(_k(cfg, "queries"), "\n".join(cfg.default_queries))
     st.session_state.setdefault(_k(cfg, "selected_indices"), [])
+    st.session_state.setdefault(_k(cfg, "ddg_backend"), "auto")
+    st.session_state.setdefault(_k(cfg, "article_filter"), "")
 
 
 def _effective_api_key(user_value: str) -> str:
@@ -48,7 +50,10 @@ def _effective_api_key(user_value: str) -> str:
     return (st.secrets.get("GEMINI_API_KEY", "") or "").strip()
 
 
-def _count_mentions_by_source(entities: Sequence[str], content_list: Sequence[dict]) -> pd.DataFrame:
+def _count_mentions_by_source(
+    entities: Sequence[str],
+    content_list: Sequence[dict],
+) -> pd.DataFrame:
     rows = []
     for e in entities:
         e_low = e.lower()
@@ -65,16 +70,32 @@ def _count_mentions_by_source(entities: Sequence[str], content_list: Sequence[di
     return df
 
 
+def _ddg_backends_from_choice(choice: str) -> Tuple[str, ...]:
+    c = (choice or "auto").strip().lower()
+    if c == "auto":
+        return ("api", "lite", "html")
+    if c in ("api", "lite", "html"):
+        return (c,)
+    return ("api", "lite", "html")
+
+
 def render_intel(cfg: IntelConfig) -> None:
     _ensure_defaults(cfg)
-
     render_page_header(cfg.header, cfg.description)
 
     debug_log: List[str] = []
 
-    # --- Sidebar (use a form to reduce accidental reruns) ---
+    # ---------- Sidebar (use a form to reduce accidental reruns) ----------
     with st.sidebar:
         st.header("Configuration")
+
+        # Pre-select index for the selectbox based on saved state
+        backend_options = ["auto", "api", "lite", "html"]
+        current_backend = st.session_state.get(_k(cfg, "ddg_backend"), "auto")
+        try:
+            backend_index = backend_options.index(current_backend)
+        except ValueError:
+            backend_index = 0
 
         with st.form(_k(cfg, "config_form")):
             api_key_input = st.text_input(
@@ -82,6 +103,13 @@ def render_intel(cfg: IntelConfig) -> None:
                 type="password",
                 value="",
                 help="If left blank, the app will use GEMINI_API_KEY from st.secrets (if configured).",
+            )
+
+            ddg_backend = st.selectbox(
+                "Search backend",
+                options=backend_options,
+                index=backend_index,
+                help="On hosted environments, 'lite' or 'html' may work when 'api' returns no results.",
             )
 
             lite_mode = st.checkbox(
@@ -106,6 +134,7 @@ def render_intel(cfg: IntelConfig) -> None:
             apply = st.form_submit_button("Apply")
 
         if apply:
+            st.session_state[_k(cfg, "ddg_backend")] = ddg_backend
             st.session_state[_k(cfg, "lite_mode")] = bool(lite_mode)
             st.session_state[_k(cfg, "num_results")] = int(num_results)
             st.session_state[_k(cfg, "queries")] = queries_input
@@ -115,10 +144,12 @@ def render_intel(cfg: IntelConfig) -> None:
             st.caption("Using credentials from st.secrets.")
 
     queries = [q.strip() for q in st.session_state[_k(cfg, "queries")].split("\n") if q.strip()]
+    ddg_choice = st.session_state.get(_k(cfg, "ddg_backend"), "auto")
+    ddg_backends = _ddg_backends_from_choice(ddg_choice)
 
     tab1, tab2 = st.tabs(["🔍 Search & Filter", "🧠 AI Extraction & Verification"])
 
-    # --- TAB 1: Search ---
+    # ===================== TAB 1: Search =====================
     with tab1:
         col1, col2 = st.columns([3, 1])
         with col1:
@@ -126,12 +157,16 @@ def render_intel(cfg: IntelConfig) -> None:
         with col2:
             if st.button("Run Search", type="primary", use_container_width=True, key=_k(cfg, "run_search")):
                 with st.spinner("Searching..."):
+                    debug_log.append(f"Search backend preference: {ddg_choice} -> using backends: {ddg_backends}")
+
+                    # IMPORTANT: relies on your updated services.py supporting ddg_backends argument
                     df = run_duckduckgo_search(
                         queries,
                         filter_func=cfg.relevance_filter,
                         num_results=int(st.session_state[_k(cfg, "num_results")]),
                         region="in-en",
                         debug_log=debug_log,
+                        ddg_backends=ddg_backends,
                     )
 
                     st.session_state[_k(cfg, "results")] = df
@@ -145,7 +180,11 @@ def render_intel(cfg: IntelConfig) -> None:
         df_results: pd.DataFrame = st.session_state.get(_k(cfg, "results"), pd.DataFrame())
 
         # --- Reset selection if search results changed (prevents stale checkbox keys) ---
-        results_token = tuple(df_results["Link"].astype(str).tolist()) if "Link" in df_results.columns else tuple(df_results.index.tolist())
+        if not df_results.empty:
+            results_token = tuple(df_results["Link"].astype(str).tolist()) if "Link" in df_results.columns else tuple(df_results.index.tolist())
+        else:
+            results_token = tuple()
+
         token_key = _k(cfg, "results_token")
         sel_key = _k(cfg, "selected_indices")
 
@@ -161,7 +200,9 @@ def render_intel(cfg: IntelConfig) -> None:
 
         if not df_results.empty:
             st.subheader("Search Results")
-            all_domains = sorted(df_results["Domain"].dropna().unique().tolist())
+
+            # Domain filter
+            all_domains = sorted(df_results["Domain"].dropna().unique().tolist()) if "Domain" in df_results.columns else []
             selected_domains = st.multiselect(
                 "Filter by Domain",
                 all_domains,
@@ -169,11 +210,14 @@ def render_intel(cfg: IntelConfig) -> None:
                 key=_k(cfg, "domains"),
             )
 
-            filtered_df = df_results[df_results["Domain"].isin(selected_domains)].copy()
+            filtered_df = df_results.copy()
+            if selected_domains and "Domain" in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df["Domain"].isin(selected_domains)].copy()
+
             st.dataframe(
                 filtered_df,
                 use_container_width=True,
-                column_config={"Link": st.column_config.LinkColumn("Link")},
+                column_config={"Link": st.column_config.LinkColumn("Link")} if "Link" in filtered_df.columns else None,
             )
 
             csv = filtered_df.to_csv(index=False).encode("utf-8")
@@ -184,7 +228,7 @@ def render_intel(cfg: IntelConfig) -> None:
                 mime="text/csv",
             )
 
-    # --- TAB 2: AI + Verification ---
+    # ===================== TAB 2: AI + Verification =====================
     with tab2:
         st.markdown("### Deep Extraction & Verification")
         st.info("Step 2: Extract entities from selected sources and verify against official lists.")
@@ -195,21 +239,20 @@ def render_intel(cfg: IntelConfig) -> None:
             with st.spinner("Fetching official registry..."):
                 st.session_state[registry_key] = cfg.registry_loader()
 
-        df_results: pd.DataFrame = st.session_state.get(_k(cfg, "results"), pd.DataFrame())
+        df_results = st.session_state.get(_k(cfg, "results"), pd.DataFrame())
         if df_results.empty:
             st.warning("Please run a search in Tab 1 first.")
             return
 
         # --- Selection UI (checkbox list + select all) ---
         sel_key = _k(cfg, "selected_indices")
-        selected_indices = set(st.session_state.get(sel_key, []))
+        selected_indices_set = set(st.session_state.get(sel_key, []))
 
         st.markdown("**Select articles to analyze:**")
 
-        # Optional filter for long lists
         filter_text = st.text_input(
             "Filter articles (title/domain)",
-            value="",
+            value=st.session_state.get(_k(cfg, "article_filter"), ""),
             key=_k(cfg, "article_filter"),
             placeholder="Type to filter…",
         )
@@ -217,10 +260,9 @@ def render_intel(cfg: IntelConfig) -> None:
         df_view = df_results.copy()
         if filter_text.strip():
             ft = filter_text.strip().lower()
-            df_view = df_view[
-                df_view["Title"].astype(str).str.lower().str.contains(ft, na=False)
-                | df_view["Domain"].astype(str).str.lower().str.contains(ft, na=False)
-            ]
+            title_ok = df_view["Title"].astype(str).str.lower().str.contains(ft, na=False) if "Title" in df_view.columns else False
+            domain_ok = df_view["Domain"].astype(str).str.lower().str.contains(ft, na=False) if "Domain" in df_view.columns else False
+            df_view = df_view[title_ok | domain_ok]
 
         col_a, col_b = st.columns([1, 1])
         with col_a:
@@ -232,13 +274,11 @@ def render_intel(cfg: IntelConfig) -> None:
 
         with col_b:
             if st.button("Clear all", key=_k(cfg, "clear_all")):
-                # Clear all checkboxes for current full results (not just filtered)
                 for idx in df_results.index.tolist():
                     st.session_state[f"{cfg.key}:cb:{idx}"] = False
                 st.session_state[sel_key] = []
                 st.rerun()
 
-        # Render checkbox list
         new_selected = set()
         for idx, row in df_view.iterrows():
             label = f"{row.get('Title','')} ({row.get('Domain','')})"
@@ -247,7 +287,7 @@ def render_intel(cfg: IntelConfig) -> None:
             checked = st.checkbox(
                 label,
                 key=cb_key,
-                value=(idx in selected_indices),
+                value=(idx in selected_indices_set),
             )
             if checked:
                 new_selected.add(idx)
@@ -255,6 +295,7 @@ def render_intel(cfg: IntelConfig) -> None:
         st.session_state[sel_key] = sorted(new_selected)
         selected_indices = st.session_state[sel_key]
 
+        # --- Extraction ---
         if st.button("Extract Platforms", type="primary", key=_k(cfg, "extract")):
             if not api_key:
                 st.error("Gemini API Key is required (enter it in the sidebar or configure st.secrets).")
@@ -288,7 +329,7 @@ def render_intel(cfg: IntelConfig) -> None:
                 else:
                     st.success(f"Extracted {len(entities)} unique entities.")
 
-        # Visualize + Verify
+        # --- Visualize + Verify ---
         entities: List[str] = st.session_state.get(_k(cfg, "entities"), [])
         content_list: List[dict] = st.session_state.get(_k(cfg, "content_list"), [])
 
@@ -314,7 +355,7 @@ def render_intel(cfg: IntelConfig) -> None:
                 registry_df: pd.DataFrame = st.session_state.get(registry_key, pd.DataFrame())
 
                 results = []
-                prog = st.progress(0)
+                prog = st.progress(0.0)
 
                 for i, name in enumerate(counts_df["Platform Name"].tolist()):
                     status, reg_id, link = generic_sebi_verifier(
@@ -337,7 +378,7 @@ def render_intel(cfg: IntelConfig) -> None:
                     column_config={"Link": st.column_config.LinkColumn("Proof Link")},
                 )
 
-        # Debug downloads
+        # --- Debug downloads ---
         st.divider()
         raw = st.session_state.get(_k(cfg, "ai_raw"), "")
         logs = st.session_state.get(_k(cfg, "debug_log"), "")

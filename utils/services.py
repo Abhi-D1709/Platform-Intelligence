@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 import google.generativeai as genai
 
+DDG_BACKENDS_DEFAULT = ("api", "lite", "html")
+
 try:
     from thefuzz import fuzz, process  # type: ignore
 except Exception:
@@ -71,6 +73,51 @@ def get_http_session() -> requests.Session:
     _session = s
     return s
 
+def _ddg_text_with_fallback(
+    query: str,
+    region: str,
+    timelimit: str,
+    max_results: int,
+    backends: Sequence[str],
+    debug_log: Optional[List[str]] = None,
+):
+    last_err = None
+
+    for backend in backends:
+        try:
+            # DDGS works better as a context manager in hosted environments
+            with DDGS() as ddgs:
+                res = list(
+                    ddgs.text(
+                        keywords=query,
+                        region=region,
+                        timelimit=timelimit,
+                        max_results=max_results,
+                        backend=backend,  # key change
+                    )
+                )
+
+            if debug_log is not None:
+                debug_log.append(
+                    f"DDG backend='{backend}' query='{query}' -> {len(res)} results"
+                )
+
+            if res:
+                return res
+
+        except Exception as e:
+            last_err = e
+            if debug_log is not None:
+                debug_log.append(
+                    f"DDG backend='{backend}' query='{query}' ERROR: {repr(e)}"
+                )
+
+    # If everything failed, raise last error (caller will log)
+    if last_err is not None:
+        raise last_err
+
+    return []
+
 # --- SEARCH ENGINE ---
 def run_duckduckgo_search(
     queries: Sequence[str],
@@ -80,9 +127,9 @@ def run_duckduckgo_search(
     timelimit: str = "y",
     pause_seconds: float = DDG_PAUSE_SECONDS,
     debug_log: Optional[List[str]] = None,
+    ddg_backends: Sequence[str] = DDG_BACKENDS_DEFAULT,  # NEW
 ) -> pd.DataFrame:
-    """DuckDuckGo search with basic hygiene filtering and an optional custom relevance filter."""
-
+    """DuckDuckGo search with optional relevance filter + backend fallback."""
     all_results: List[dict] = []
 
     for q in queries:
@@ -91,43 +138,43 @@ def run_duckduckgo_search(
             continue
 
         try:
-            results = DDGS().text(
-                keywords=query,
+            results = _ddg_text_with_fallback(
+                query=query,
                 region=region,
-                max_results=num_results + 10,
                 timelimit=timelimit,
+                max_results=num_results + 10,
+                backends=ddg_backends,
+                debug_log=debug_log,
             )
 
-            if results:
-                for res in results:
-                    title = res.get("title", "") or ""
-                    snippet = res.get("body", "") or ""
-                    link = res.get("href", "") or ""
+            for res in results or []:
+                title = res.get("title", "") or ""
+                snippet = res.get("body", "") or ""
+                link = res.get("href", "") or ""
+                if not link:
+                    continue
 
-                    if not link:
-                        continue
+                if _is_junk(title, snippet):
+                    continue
 
-                    if _is_junk(title, snippet):
-                        continue
+                if filter_func and not filter_func(title, snippet, query):
+                    continue
 
-                    if filter_func and not filter_func(title, snippet, query):
-                        continue
-
-                    all_results.append(
-                        {
-                            "Title": title,
-                            "Link": link,
-                            "Snippet": snippet,
-                            "Source Query": query,
-                            "Domain": urlparse(link).netloc,
-                        }
-                    )
+                all_results.append(
+                    {
+                        "Title": title,
+                        "Link": link,
+                        "Snippet": snippet,
+                        "Source Query": query,
+                        "Domain": urlparse(link).netloc,
+                    }
+                )
 
             if pause_seconds:
                 time.sleep(pause_seconds)
 
         except Exception as e:
-            msg = f"Search error for query '{query}': {e}"
+            msg = f"Search failure for '{query}': {repr(e)}"
             logger.exception(msg)
             if debug_log is not None:
                 debug_log.append(msg)
